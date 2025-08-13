@@ -1,0 +1,322 @@
+import argparse
+import itertools
+import multiprocessing as mp
+import os
+import string
+import time
+import zipfile
+from typing import Generator, List, Tuple, Optional
+
+
+def _try_password(zf: zipfile.ZipFile, member: str, candidate: str) -> bool:
+    try:
+        with zf.open(member, pwd=candidate.encode('utf-8')) as f:
+            _ = f.read(1)  # 1바이트만 읽어서 빠르게 검증
+        return True
+    except Exception:
+        return False
+
+
+def _get_smallest_member(zf: zipfile.ZipFile) -> str:
+    members = zf.namelist()
+    if not members:
+        raise ValueError("ZIP 파일이 비어있습니다")
+    
+    smallest = members[0]
+    smallest_size = zf.getinfo(smallest).file_size
+    
+    for member in members[1:]:
+        size = zf.getinfo(member).file_size
+        if size < smallest_size:
+            smallest = member
+            smallest_size = size
+    
+    return smallest
+
+
+def _print_progress(start_ts: float, attempts: int, last_try: str, print_every: int):
+    """진행상황을 출력"""
+    if attempts % print_every != 0:
+        return
+    
+    elapsed = time.time() - start_ts
+    speed = attempts / elapsed if elapsed > 0 else 0.0
+    start_time_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(start_ts))
+    
+    print(f'[progress] started={start_time_str} attempts={attempts:,} '
+          f'elapsed={elapsed:.1f}s speed={speed:,.0f}/s last="{last_try}"', flush=True)
+
+
+def _generate_candidates_basic() -> Generator[str, None, None]:
+    charset = string.digits + string.ascii_lowercase  # 0-9a-z
+    for candidate in itertools.product(charset, repeat=6):
+        yield ''.join(candidate)
+
+
+def _generate_candidates_smart(mask: Optional[str] = None) -> Generator[str, None, None]:
+    charset = string.digits + string.ascii_lowercase
+    
+    if mask:
+        # 마스크가 지정된 경우 (d=digit, l=lowercase, a=any)
+        yield from _generate_from_mask(mask)
+        return
+    
+    # 우선순위 기반 탐색 - 수정된 버전
+    # 1. 숫자 6자리 먼저
+    print("[smart] 숫자 6자리 패턴 탐색 중...")
+    for candidate in itertools.product(string.digits, repeat=6):
+        yield ''.join(candidate)
+    
+    # 2. 소문자 6자리
+    print("[smart] 소문자 6자리 패턴 탐색 중...")
+    for candidate in itertools.product(string.ascii_lowercase, repeat=6):
+        yield ''.join(candidate)
+    
+    # 3. 혼합 패턴들 - 숫자 개수별로 체계적 탐색
+    for num_digits in range(1, 6):  # 1~5개 숫자
+        num_letters = 6 - num_digits
+        print(f"[smart] 숫자 {num_digits}개 + 소문자 {num_letters}개 패턴 탐색 중...")
+        
+        # 숫자와 소문자의 위치 조합 생성
+        positions = list(range(6))
+        for digit_positions in itertools.combinations(positions, num_digits):
+            letter_positions = [i for i in positions if i not in digit_positions]
+            
+            # 각 위치에 대해 문자 조합 생성
+            for digits in itertools.product(string.digits, repeat=num_digits):
+                for letters in itertools.product(string.ascii_lowercase, repeat=num_letters):
+                    candidate = [''] * 6
+                    for i, pos in enumerate(digit_positions):
+                        candidate[pos] = digits[i]
+                    for i, pos in enumerate(letter_positions):
+                        candidate[pos] = letters[i]
+                    yield ''.join(candidate)
+
+
+def _generate_from_mask(mask: str) -> Generator[str, None, None]:
+    charsets = []
+    for char in mask:
+        if char == 'd':
+            charsets.append(string.digits)
+        elif char == 'l':
+            charsets.append(string.ascii_lowercase)
+        elif char == 'a':
+            charsets.append(string.digits + string.ascii_lowercase)
+        else:
+            raise ValueError(f"잘못된 마스크 문자: {char}")
+    
+    for candidate in itertools.product(*charsets):
+        yield ''.join(candidate)
+
+
+def _matches_any_pattern(candidate: str, patterns: List[str]) -> bool:
+    for pattern in patterns:
+        if _matches_pattern(candidate, pattern):
+            return True
+    return False
+
+
+def _matches_pattern(candidate: str, pattern: str) -> bool:
+    if len(candidate) != len(pattern):
+        return False
+    
+    for c, p in zip(candidate, pattern):
+        if p == 'd' and not c.isdigit():
+            return False
+        elif p == 'l' and not c.islower():
+            return False
+        elif p == 'a':
+            continue  # any character is OK
+    return True
+
+
+def _base36_to_string(num: int, length: int = 6) -> str:
+    charset = string.digits + string.ascii_lowercase
+    result = []
+    
+    for _ in range(length):
+        result.append(charset[num % 36])
+        num //= 36
+    
+    return ''.join(reversed(result))
+
+
+def _worker_process(args: Tuple) -> Optional[str]:
+    """멀티프로세싱 워커 프로세스"""
+    zip_path, member, start_idx, stride, max_attempts, print_every = args
+    
+    try:
+        with zipfile.ZipFile(zip_path, 'r') as zf:
+            attempts = 0
+            current_idx = start_idx
+            
+            while attempts < max_attempts:
+                candidate = _base36_to_string(current_idx)
+                attempts += 1
+                
+                if _try_password(zf, member, candidate):
+                    return candidate
+                
+                if print_every > 0 and attempts % print_every == 0:
+                    print(f'[worker-{start_idx}] attempts={attempts:,} last="{candidate}"', flush=True)
+                
+                current_idx += stride
+                
+                # 36^6을 넘어가면 중단
+                if current_idx >= 36**6:
+                    break
+                    
+    except Exception as e:
+        print(f'[worker-{start_idx}] 오류: {e}')
+    
+    return None
+
+
+def unlock_zip(zip_path: str = 'emergency_storage_key.zip', 
+               mode: str = 'basic', 
+               workers: int = None, 
+               print_every: int = 1000, 
+               mask: str = None) -> Optional[str]:
+    if not os.path.exists(zip_path):
+        print(f"오류: ZIP 파일을 찾을 수 없습니다: {zip_path}")
+        return None
+    
+    try:
+        with zipfile.ZipFile(zip_path, 'r') as zf:
+            member = _get_smallest_member(zf)
+            print(f"대상 ZIP: {zip_path}")
+            print(f"테스트 파일: {member} ({zf.getinfo(member).file_size} bytes)")
+            print(f"탐색 모드: {mode}")
+            
+            start_time = time.time()
+            attempts = 0
+            
+            if mode == 'basic':
+                print("완전탐색 모드로 시작합니다...")
+                candidates = _generate_candidates_basic()
+                
+                for candidate in candidates:
+                    attempts += 1
+                    
+                    if _try_password(zf, member, candidate):
+                        elapsed = time.time() - start_time
+                        print(f"\n🎉 비밀번호를 찾았습니다!")
+                        print(f"비밀번호: {candidate}")
+                        print(f"시도 횟수: {attempts:,}")
+                        print(f"소요 시간: {elapsed:.2f}초")
+                        print(f"평균 속도: {attempts/elapsed:,.0f} 시도/초")
+                        
+                        # password.txt에 저장
+                        with open('password.txt', 'w') as f:
+                            f.write(candidate)
+                        print("비밀번호를 password.txt에 저장했습니다.")
+                        
+                        return candidate
+                    
+                    _print_progress(start_time, attempts, candidate, print_every)
+            
+            elif mode == 'smart':
+                print("스마트 탐색 모드로 시작합니다...")
+                if mask:
+                    print(f"마스크: {mask}")
+                
+                candidates = _generate_candidates_smart(mask)
+                
+                for candidate in candidates:
+                    attempts += 1
+                    
+                    if _try_password(zf, member, candidate):
+                        elapsed = time.time() - start_time
+                        print(f"\n 비밀번호를 찾았습니다!")
+                        print(f"비밀번호: {candidate}")
+                        print(f"시도 횟수: {attempts:,}")
+                        print(f"소요 시간: {elapsed:.2f}초")
+                        print(f"평균 속도: {attempts/elapsed:,.0f} 시도/초")
+                        
+                        # password.txt에 저장
+                        with open('password.txt', 'w') as f:
+                            f.write(candidate)
+                        print("비밀번호를 password.txt에 저장했습니다.")
+                        
+                        return candidate
+                    
+                    _print_progress(start_time, attempts, candidate, print_every)
+            
+            elif mode == 'mp':
+                if workers is None:
+                    workers = max(1, mp.cpu_count() - 1)
+                
+                print(f"멀티프로세싱 모드로 시작합니다... (워커: {workers}개)")
+                
+                # 전체 공간을 워커 수만큼 분할
+                max_space = 36**6
+                max_attempts_per_worker = max_space // workers + 1
+                
+                # 워커 프로세스 인수 준비
+                worker_args = []
+                for i in range(workers):
+                    args = (zip_path, member, i, workers, max_attempts_per_worker, print_every)
+                    worker_args.append(args)
+                
+                # 멀티프로세싱 실행
+                with mp.Pool(workers) as pool:
+                    results = pool.map(_worker_process, worker_args)
+                
+                # 결과 확인
+                for result in results:
+                    if result:
+                        elapsed = time.time() - start_time
+                        print(f"\n 비밀번호를 찾았습니다!")
+                        print(f"비밀번호: {result}")
+                        print(f"소요 시간: {elapsed:.2f}초")
+                        
+                        # password.txt에 저장
+                        with open('password.txt', 'w') as f:
+                            f.write(result)
+                        print("비밀번호를 password.txt에 저장했습니다.")
+                        
+                        return result
+            
+            else:
+                print(f"오류: 알 수 없는 모드: {mode}")
+                return None
+            
+            print("\n비밀번호를 찾지 못했습니다.")
+            return None
+            
+    except zipfile.BadZipFile:
+        print(f"오류: 올바른 ZIP 파일이 아닙니다: {zip_path}")
+        return None
+    except Exception as e:
+        print(f"오류: {e}")
+        return None
+
+
+def main():
+    """단순화된 메인 함수 - 기본 설정으로 ZIP 파일 해킹 실행"""
+    zip_path = 'emergency_storage_key.zip'
+    
+    print("=== ZIP 비밀번호 크래킹 도구 ===")
+    print(f"대상 파일: {zip_path}")
+    
+    if not os.path.exists(zip_path):
+        print(f"오류: ZIP 파일을 찾을 수 없습니다: {zip_path}")
+        return
+    
+    # 스마트 모드로 비밀번호 찾기 시도
+    password = unlock_zip(
+        zip_path=zip_path,
+        mode='smart',
+        workers=None,  # 자동으로 CPU 코어 수 결정
+        print_every=1000,
+        mask=None
+    )
+    
+    if password:
+        print(f"\n🎉 성공적으로 비밀번호를 찾았습니다: {password}")
+    else:
+        print("\n❌ 비밀번호를 찾지 못했습니다.")
+
+
+if __name__ == '__main__':
+    main()
