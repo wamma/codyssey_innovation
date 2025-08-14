@@ -1,11 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-door_hacking.py
----------------
-Zip(ZipCrypto 또는 AES)으로 암호화된 파일의 6자리 소문자/숫자 비밀번호를
-사전/마스크/병렬 브루트포스로 시도하는 스크립트.
-"""
-
 import argparse
 import itertools
 import os
@@ -15,7 +7,6 @@ import string
 import multiprocessing as mp
 from typing import Iterable, List, Optional
 
-# AES 지원을 위해 pyzipper가 있으면 사용, 없으면 표준 zipfile 사용
 try:
     import pyzipper as zfmod
     _USE_PYZIPPER = True
@@ -32,7 +23,6 @@ g_counter = None
 g_found_event = None
 
 def init_worker(counter_, found_event_):
-    """Pool 워커 초기화 함수"""
     global g_counter, g_found_event
     g_counter = counter_
     g_found_event = found_event_
